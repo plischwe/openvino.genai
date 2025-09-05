@@ -431,17 +431,17 @@ EncodedImage VisionEncoderMiniCPM::encode(const ov::Tensor& image, const ov::Any
     auto embedding_start = std::chrono::high_resolution_clock::now();
     EncodedImage encoded_image = llava_image_embed_make_with_bytes_slice(ctx_clip, image, encoder, config.max_slice_nums, config.scale_resolution, config.patch_size, 0 == config.max_slice_nums);
     auto embedding_end = std::chrono::high_resolution_clock::now();
-    auto embedding_duration = std:chrono::duration_cast<std::chrono::milliseconds>(embedding_end - embedding_start);
+    auto embedding_duration = std::chrono::duration_cast<std::chrono::milliseconds>(embedding_end - embedding_start);
     std::cout << "Vision embedding generation time: " << embedding_duration.count() << " ms" << std::endl;
 
     auto resampling_start = std::chrono::high_resolution_clock::now();
     encoded_image.resampled_image = resample_encoded_image(encoded_image);
     auto resampling_end = std::chrono::high_resolution_clock::now();
-    auto resampling_duration = std:chrono::duration_cast<std::chrono::milliseconds>(resampling_end - resampling_start);
+    auto resampling_duration = std::chrono::duration_cast<std::chrono::milliseconds>(resampling_end - resampling_start);
     std::cout << "Vision resampling time: " << resampling_duration.count() << " ms" << std::endl;
 
     auto end_time = std::chrono::high_resolution_clock::now();
-    auto total_duration = std:chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+    auto total_duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
     std::cout << "=== Total MiniCPM Vision Encoding time: " << total_duration.count() << " ms ===" << std::endl;
 
     return encoded_image;
