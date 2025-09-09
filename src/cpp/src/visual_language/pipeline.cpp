@@ -256,8 +256,10 @@ public:
             m_sampler.set_seed(generation_config.rng_seed);
         }
 
+        auto lm_generation_start = std::chrono::steady_clock::now();
         ov::genai::utils::GenerationFinishInfo finish_info = ov::genai::get_lm_encoded_results(m_language, inputs_embeds, new_atten_mask, streamer_ptr, m_sampler, requests,
                                                                                                position_ids, token_type_ids, kv_cache_state, m_embedding, rope_delta, m_max_kv_cache_size);
+        auto lm_generation_end = std::chrono::steady_clock::now();
         EncodedResults& encoded_result = finish_info.results;
 
         auto decode_start_time = std::chrono::steady_clock::now();
@@ -298,6 +300,22 @@ public:
 
         // VLM specific perf metrics
         decoded.perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.emplace_back(PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds));
+
+        // Calculate individual durations for printing
+        auto total_generation_duration = PerfMetrics::get_microsec(generate_end_time - generate_start_time);
+        auto embeddings_preparation_duration = PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds);
+        auto lm_generation_duration = PerfMetrics::get_microsec(lm_generation_end - lm_generation_start);
+        auto detokenization_duration = PerfMetrics::get_microsec(decode_end_time - decode_start_time);
+
+        // Print performance metrics with detailed explanations
+        std::cout << "\n=== VLM Generation Performance Metrics ===" << std::endl;
+        std::cout << "Total Generation Time: " << total_generation_duration / 1000.0 << " ms" << std::endl;
+        std::cout << "  └─ Embeddings Preparation: " << embeddings_preparation_duration / 1000.0 << " ms" << std::endl;
+        std::cout << "  └─ Language Model Generation: " << lm_generation_duration / 1000.0 << " ms" << std::endl;
+        std::cout << "  └─ Detokenization: " << detokenization_duration / 1000.0 << " ms" << std::endl;
+        std::cout << "Input Tokens: " << decoded.perf_metrics.num_input_tokens << std::endl;
+        std::cout << "Output Tokens: " << (encoded_result.tokens.size() > 0 ? encoded_result.tokens[0].size() : 0) << std::endl;
+        std::cout << "========================================\n" << std::endl;
 
         // Evaluate statistics
         decoded.perf_metrics.m_evaluated = false;
