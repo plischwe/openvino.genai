@@ -3,6 +3,8 @@
 
 #include <optional>
 #include <random>
+#include <chrono>
+#include <iostream>
 
 #include "openvino/genai/visual_language/pipeline.hpp"
 #include "openvino/genai/visual_language/perf_metrics.hpp"
