@@ -163,17 +163,15 @@ public:
         VLMPerfMetrics perf_metrics;
         auto& raw_counters = perf_metrics.raw_metrics;
         auto& raw_vlm_counters = perf_metrics.vlm_raw_metrics;
-
+    
         if (!m_is_chat_conversation) {
             m_language.reset_state();
             m_language.get_tensor("attention_mask").set_shape({1, 0});
         }
-
-        // If stop_token_ids were not provided, take value from default m_generation_config
+    
+        // Setup stop/eos tokens
         if (generation_config.stop_token_ids.empty())
             generation_config.stop_token_ids = m_generation_config.stop_token_ids;
-
-        // If eos_token_id was not provided, take value from default m_generation_config
         if (generation_config.eos_token_id == -1)
             generation_config.set_eos_token_id(m_generation_config.eos_token_id);
         generation_config.validate();
@@ -185,14 +183,14 @@ public:
             OPENVINO_ASSERT(generation_config.num_return_sequences == 1u,
                 "Currently only \"num_return_sequences\" equal to 1 is supported for NPU device!");
         }
-
+    
         const auto encoded_images = m_inputs_embedder->encode_images(rgbs);
         auto [unified_prompt, image_sequence] = m_inputs_embedder->normalize_prompt(prompt, m_image_id, encoded_images);
-
+    
         if (m_is_chat_conversation) {
             m_history.push_back({{"role", "user"}, {"content", unified_prompt}});
             unified_prompt = m_tokenizer.apply_chat_template(m_history, true);
-
+    
             for (size_t idx = 0; idx < image_sequence.size(); idx++) {
                 image_sequence[idx] -= m_image_id;
             }
@@ -200,10 +198,10 @@ public:
         else {
             m_inputs_embedder->set_apply_chat_template_status(generation_config.apply_chat_template);
         }
-
+    
         ov::Tensor inputs_embeds;
         std::optional<ov::Tensor> token_type_ids;
-
+    
         auto start_get_inputs_embeds = std::chrono::steady_clock::now();
         if (m_inputs_embedder->has_token_type_ids()) {
             std::tie(inputs_embeds, token_type_ids) =
@@ -218,72 +216,73 @@ public:
         auto end_get_inputs_embeds = std::chrono::steady_clock::now();
 
         if (m_is_npu) {
-            OPENVINO_ASSERT(rgbs.size() == 1u, "Currently only batch size equal to 1 is supported for NPU device!");
-            OPENVINO_ASSERT(generation_config.is_greedy_decoding() || generation_config.is_multinomial(),
-                "Currently only greedy and multinomial decoding are supported for NPU device!");
-            OPENVINO_ASSERT(generation_config.num_return_sequences == 1u,
-                "Currently only \"num_return_sequences\" equal to 1 is supported for NPU device!");
+            // Prefill model in NPU is reshaped to NPUW_LLM_MAX_PROMPT_LEN x NPUW_LLM_MAX_PROMPT_LEN
+            OPENVINO_ASSERT(inputs_embeds.get_shape().at(1) <= m_max_prompt_len,
+                "VLM pipeline on NPU may only process input embeddings up to ", m_max_prompt_len,
+                " tokens. ", inputs_embeds.get_shape().at(1), " is passed.\nSet the \"MAX_PROMPT_LEN\""
+                " config option to increase the limit.");
         }
-
+    
         std::cout << "--- Embedding performance ---" << std::endl;
         std::cout << "Text embedding + vision fusion time: "
-                << std::chrono::duration_cast<std::chrono::milliseconds>(end_get_inputs_embeds - start_get_inputs_embeds).count()
-                << " ms" << std::endl;
-
+                  << std::chrono::duration_cast<std::chrono::milliseconds>(end_get_inputs_embeds - start_get_inputs_embeds).count()
+                  << " ms" << std::endl;
+    
         utils::KVCacheState& kv_cache_state = m_inputs_embedder->get_kv_cache_state();
         if (m_is_chat_conversation)
             utils::trim_kv_cache(m_language, kv_cache_state, std::nullopt);
-
+    
         std::vector<SequenceGroup::Ptr> requests;
         size_t request_id = 0;
-        size_t block_size = 1;
-
+        size_t block_size = 1; //not used
+    
         size_t history_size = m_language.get_tensor("attention_mask").get_shape().at(1) - kv_cache_state.num_tokens_to_trim;
         size_t inputs_embeds_size = inputs_embeds.get_shape().at(1);
-
+    
         std::vector<int64_t> tokenized_history = kv_cache_state.get_state();
         ov::Tensor prompt_ids(ov::element::i64, { history_size + inputs_embeds_size });
+        OPENVINO_ASSERT(prompt_ids.get_size() >= tokenized_history.size(), "Prompt ids size is less than tokenized history size");
         std::fill_n(prompt_ids.data<int64_t>(), prompt_ids.get_size(), m_tokenizer.get_pad_token_id());
         std::copy(tokenized_history.begin(), tokenized_history.end(), prompt_ids.data<int64_t>());
-
+    
         SequenceGroup::Ptr sequence_group = std::make_shared<SequenceGroup>(request_id, prompt_ids, generation_config, block_size);
         requests.push_back(sequence_group);
-
+    
         std::shared_ptr<StreamerBase> streamer_ptr = utils::create_streamer(streamer, m_tokenizer);
 
         OPENVINO_ASSERT(streamer_ptr == nullptr || generation_config.num_return_sequences == 1 &&
             (generation_config.is_greedy_decoding() || generation_config.is_multinomial()),
             "Currently streaming is possible only with batch size=1 and only for greedy or multinomial decoding");
-
+    
         ov::Tensor new_atten_mask = ov::Tensor{ov::element::i64, { 1, history_size + inputs_embeds_size }};
         std::fill_n(new_atten_mask.data<int64_t>(), new_atten_mask.get_size(), 1);
-
+    
         ov::Tensor position_ids;
         std::optional<int64_t> rope_delta;
         std::tie(position_ids, rope_delta) = m_inputs_embedder->get_position_ids(inputs_embeds_size, history_size);
-
+    
         if (m_sampler.get_seed() != generation_config.rng_seed) {
             m_sampler.set_seed(generation_config.rng_seed);
         }
-
+    
         // --- Actual LM decoding ---
         ov::genai::utils::GenerationFinishInfo finish_info = ov::genai::get_lm_encoded_results(
             m_language, inputs_embeds, new_atten_mask, streamer_ptr, m_sampler, requests,
             position_ids, token_type_ids, kv_cache_state, m_embedding, rope_delta, m_max_kv_cache_size
         );
-
+    
         EncodedResults& encoded_result = finish_info.results;
-
+    
         // --- Token-level generation performance ---
         std::cout << "--- Token generation performance ---" << std::endl;
         for (size_t i = 0; i < encoded_result.tokens.size(); ++i) {
             const auto& token_times = encoded_result.perf_metrics.token_generation_durations;
             if (i < token_times.size()) {
                 std::cout << "Token " << i << " generated in "
-                        << token_times[i] << " microseconds" << std::endl;
+                          << token_times[i] << " microseconds" << std::endl;
             }
         }
-
+    
         // --- Detokenization ---
         auto decode_start_time = std::chrono::steady_clock::now();
         VLMDecodedResults decoded;
@@ -293,9 +292,26 @@ public:
         }
         auto decode_end_time = std::chrono::steady_clock::now();
 
-        decoded.perf_metrics = encoded_result.perf_metrics;
-        auto generate_end_time = std::chrono::steady_clock::now();
+        std::string decoded_results = decoded.texts.at(0);
+        if (m_is_chat_conversation) {
+            m_inputs_embedder->update_chat_history(decoded_results, finish_info.streaming_finish_status);
 
+            if (finish_info.streaming_finish_status != ov::genai::GenerationStatus::CANCEL) {
+                m_image_id += encoded_images.size();
+                // Tail of chat template is missing in KV cache.
+                // Find the tail to concatenate it with the next input prompt.
+                m_history.push_back({{"role", "assistant"}, {"content", decoded_results}});
+            }
+            else {
+                m_history.pop_back();
+            }
+        }
+        else
+            kv_cache_state.reset_state();
+    
+        auto generate_end_time = std::chrono::steady_clock::now();
+        decoded.perf_metrics = encoded_result.perf_metrics;
+    
         // Update overall perf metrics
         decoded.perf_metrics.num_input_tokens = prompt_ids.get_size();
         decoded.perf_metrics.load_time = this->get_load_time();
@@ -311,11 +327,11 @@ public:
             raw_counters.tokenization_durations.begin(),
             raw_counters.tokenization_durations.end()
         );
-
+    
         decoded.perf_metrics.vlm_raw_metrics.prepare_embeddings_durations.emplace_back(
             PerfMetrics::get_microsec(end_get_inputs_embeds - start_get_inputs_embeds)
         );
-
+    
         return decoded;
     }
 
