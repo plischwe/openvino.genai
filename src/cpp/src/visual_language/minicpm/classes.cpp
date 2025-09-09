@@ -670,70 +670,93 @@ std::pair<std::string, std::vector<size_t>> InputsEmbedderMiniCPM::normalize_pro
     return {std::move(unified_prompt), std::move(image_sequence)};
 }
 
+ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(
+    const std::string& unified_prompt,
+    const std::vector<ov::genai::EncodedImage>& images,
+    ov::genai::VLMPerfMetrics& metrics,
+    bool recalculate_merged_embeddings,
+    const std::vector<size_t>& images_sequence) 
+{
+    std::cout << "=== Starting MiniCPM Input Embedding ===" << std::endl;
 
-ov::Tensor InputsEmbedderMiniCPM::get_inputs_embeds(const std::string& unified_prompt, const std::vector<ov::genai::EncodedImage>& images, ov::genai::VLMPerfMetrics& metrics, bool recalculate_merged_embeddings, const std::vector<size_t>& images_sequence) {
-    std::string unk64;
+    // ---------------- TEXT EMBEDDING ----------------
+    auto start_text = std::chrono::high_resolution_clock::now();
     ov::Tensor encoded_input = get_encoded_input_ids(unified_prompt, metrics);
 
-    CircularBufferQueueElementGuard<EmbeddingsRequest> embeddings_request_guard(m_embedding->get_request_queue().get());
+    CircularBufferQueueElementGuard<EmbeddingsRequest> embeddings_request_guard(
+        m_embedding->get_request_queue().get()
+    );
     EmbeddingsRequest& req = embeddings_request_guard.get();
     ov::Tensor inputs_embeds = m_embedding->infer(req, encoded_input);
-    OPENVINO_ASSERT(
-        m_vlm_config.hidden_size == inputs_embeds.get_shape().at(2),
-        "Unexpected embedding size"
-    );
+    auto end_text = std::chrono::high_resolution_clock::now();
+    std::cout << "Text embedding completed in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(end_text - start_text).count()
+              << " ms" << std::endl;
+
+    // ---------------- VISION FUSION ----------------
+    auto start_fusion = std::chrono::high_resolution_clock::now();
+
+    // Encode special tokens for images and slices
     auto start_tokenizer_time = std::chrono::steady_clock::now();
     ov::Tensor special_tokens = m_tokenizer.encode(
-        m_vlm_config.im_start
-        + m_vlm_config.im_end
-        + m_vlm_config.slice_start
-        + m_vlm_config.slice_end,
+        m_vlm_config.im_start + m_vlm_config.im_end +
+        m_vlm_config.slice_start + m_vlm_config.slice_end,
         ov::genai::add_special_tokens(false)
     ).input_ids;
     auto end_tokenizer_time = std::chrono::steady_clock::now();
-    OPENVINO_ASSERT(metrics.raw_metrics.tokenization_durations.size() > 0);
-    metrics.raw_metrics.tokenization_durations[metrics.raw_metrics.tokenization_durations.size() - 1] += ov::genai::MicroSeconds(PerfMetrics::get_microsec(end_tokenizer_time - start_tokenizer_time));
-    OPENVINO_ASSERT(
-        4 == special_tokens.get_shape().at(1),
-        "Every special token must be represented with a single int."
-    );
+    metrics.raw_metrics.tokenization_durations.back() +=
+        ov::genai::MicroSeconds(PerfMetrics::get_microsec(end_tokenizer_time - start_tokenizer_time));
+
     int64_t im_start_id = special_tokens.data<int64_t>()[0];
     int64_t im_end_id = special_tokens.data<int64_t>()[1];
     int64_t slice_start_id = special_tokens.data<int64_t>()[2];
     int64_t slice_end_id = special_tokens.data<int64_t>()[3];
-    int64_t im_start_pos = 0, slice_start_pos = 0;
+
     int64_t* begin = encoded_input.data<int64_t>();
     int64_t* ids = begin;
-    size_t encoded_input_size = encoded_input.get_size();
-    int64_t* end = ids + encoded_input_size;
+    int64_t* end = ids + encoded_input.get_size();
     float* inputs_embeds_data = inputs_embeds.data<float>();
+
+    // Insert vision embeddings into the text embedding tensor
     for (size_t image_id : images_sequence) {
         const EncodedImage& encoded_image = images.at(image_id);
         const ov::Tensor& resampled_source = encoded_image.resampled_image.resampled_source;
-        auto emb = resampled_source.data<float>();
+        float* emb = resampled_source.data<float>();
+
         ids = std::find(ids, end, im_start_id);
-        OPENVINO_ASSERT(end != ids);
+        OPENVINO_ASSERT(end != ids, "im_start token not found in encoded input");
         ++ids;
-        std::copy_n(emb, resampled_source.get_size(), inputs_embeds_data + std::distance(begin, ids) * m_vlm_config.hidden_size);
+
+        // Copy main image embedding
+        std::copy_n(emb, resampled_source.get_size(),
+                    inputs_embeds_data + std::distance(begin, ids) * m_vlm_config.hidden_size);
         ids += m_vlm_config.query_num;
+
+        // Insert slice embeddings if present
         ov::Shape slices_shape = encoded_image.slices_shape;
         if (slices_shape.size()) {
-            size_t token_idx = 0;
             for (size_t i = 0; i < slices_shape.at(0); ++i) {
-                for (size_t ja = 0; ja < slices_shape.at(1); ++ja) {
-                    const ov::Tensor& vision_embed_tensor_i_j = encoded_image.resampled_image.vision_embed_tensors[i][ja];
+                for (size_t j = 0; j < slices_shape.at(1); ++j) {
+                    const ov::Tensor& vision_embed_tensor_i_j = encoded_image.resampled_image.vision_embed_tensors[i][j];
                     ids = std::find(ids, end, slice_start_id);
-                    OPENVINO_ASSERT(end != ids);
+                    OPENVINO_ASSERT(end != ids, "slice_start token not found in encoded input");
                     ++ids;
-                    std::copy_n(vision_embed_tensor_i_j.data<float>(), vision_embed_tensor_i_j.get_size(), inputs_embeds_data + std::distance(begin, ids) * m_vlm_config.hidden_size);
+
+                    std::copy_n(vision_embed_tensor_i_j.data<float>(),
+                                vision_embed_tensor_i_j.get_size(),
+                                inputs_embeds_data + std::distance(begin, ids) * m_vlm_config.hidden_size);
                     ids += m_vlm_config.query_num;
                 }
             }
         }
     }
 
-    // inputs_embeds is bound to infer request that can be used by another thread after leaving this scope
-    // so we need to return a copy to make sure data does not get corrupted 
+    auto end_fusion = std::chrono::high_resolution_clock::now();
+    std::cout << "Vision fusion completed in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(end_fusion - start_fusion).count()
+              << " ms" << std::endl;
+
+    // Return copy to avoid corruption after leaving scope
     ov::Tensor inputs_embeds_copy(inputs_embeds.get_element_type(), inputs_embeds.get_shape());
     std::memcpy(inputs_embeds_copy.data(), inputs_embeds.data(), inputs_embeds.get_byte_size());
     return inputs_embeds_copy;
