@@ -5,6 +5,9 @@
 
 #include "utils.hpp"
 
+#include <iostream>
+#include <chrono>
+
 namespace ov::genai {
 
 namespace qwen2_5_vl_utils {
@@ -149,25 +152,96 @@ ov::Tensor InputsEmbedderQwen2_5_VL::run_image_embeddings_merger(
     const std::vector<EncodedImage>& images, 
     const std::vector<size_t>& images_sequence
 ) {
+    auto start_time = std::chrono::high_resolution_clock::now();
+    std::cout << "=== Starting Qwen2.5-VL Image Embeddings Merger ===" << std::endl;
+
+    // Image reordering and concatenation
+    auto reorder_start = std::chrono::high_resolution_clock::now();
     auto [reordered_image_embeds, reordered_images_grid_thw] = qwen2_vl_utils::reorder_image_embeds_and_grid_thw(images, images_sequence);
+    auto reorder_end = std::chrono::high_resolution_clock::now();
+    std::cout << "Image reordering completed in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(reorder_end - reorder_start).count()
+              << " ms" << std::endl;
 
+    // Concatenation
+    auto concat_start = std::chrono::high_resolution_clock::now();
     ov::Tensor concatenated_embeds = qwen2_vl_utils::concatenate_image_embeds(reordered_image_embeds);
-    ov::Tensor rotary_pos_emb = get_rotary_pos_emb(reordered_images_grid_thw);
+    auto concat_end = std::chrono::high_resolution_clock::now();
+    std::cout << "Image concatenation completed in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(concat_end - concat_start).count()
+              << " ms" << std::endl;
 
+    // Print concatenated embeddings shape
+    std::cout << "Concatenated embeddings shape: [";
+    for (size_t i = 0; i < concatenated_embeds.get_shape().size(); ++i) {
+        std::cout << concatenated_embeds.get_shape()[i];
+        if (i < concatenated_embeds.get_shape().size() - 1) std::cout << ", ";
+    }
+    std::cout << "] (size: " << concatenated_embeds.get_size() << " elements)" << std::endl;
+
+    // Rotary position embedding
+    auto rotary_start = std::chrono::high_resolution_clock::now();
+    ov::Tensor rotary_pos_emb = get_rotary_pos_emb(reordered_images_grid_thw);
+    auto rotary_end = std::chrono::high_resolution_clock::now();
+    std::cout << "Rotary position embedding completed in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(rotary_end - rotary_start).count()
+              << " ms" << std::endl;
+
+    // Print rotary position embedding shape
+    std::cout << "Rotary position embedding shape: [";
+    for (size_t i = 0; i < rotary_pos_emb.get_shape().size(); ++i) {
+        std::cout << rotary_pos_emb.get_shape()[i];
+        if (i < rotary_pos_emb.get_shape().size() - 1) std::cout << ", ";
+    }
+    std::cout << "] (size: " << rotary_pos_emb.get_size() << " elements)" << std::endl;
+
+    // Window index calculation
+    auto window_start = std::chrono::high_resolution_clock::now();
     auto [window_index, cu_window_seqlens] = qwen2_5_vl_utils::get_window_index(
         reordered_images_grid_thw,
         m_vision_encoder->get_processor_config(),
         m_vlm_config
     );
+    auto window_end = std::chrono::high_resolution_clock::now();
+    std::cout << "Window index calculation completed in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(window_end - window_start).count()
+              << " ms" << std::endl;
 
+    // Print window index shape
+    std::cout << "Window index shape: [";
+    for (size_t i = 0; i < window_index.get_shape().size(); ++i) {
+        std::cout << window_index.get_shape()[i];
+        if (i < window_index.get_shape().size() - 1) std::cout << ", ";
+    }
+    std::cout << "] (size: " << window_index.get_size() << " elements)" << std::endl;
+
+    // Vision embeddings merger inference
+    auto merger_start = std::chrono::high_resolution_clock::now();
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(this->m_ireq_queue_vision_embeddings_merger.get());
     ov::InferRequest& vision_embeddings_merger = infer_request_guard.get();
     vision_embeddings_merger.set_tensor("hidden_states", concatenated_embeds);
+    
     if (m_with_cu_seqlens_input) {
         ov::Tensor cu_seq_lens = qwen2_vl_utils::get_cu_seqlens(reordered_images_grid_thw);
         ov::Tensor t_cu_window_seqlens = qwen2_5_vl_utils::get_cu_window_seqlens(cu_window_seqlens);
         vision_embeddings_merger.set_tensor("cu_seq_lens", cu_seq_lens);
         vision_embeddings_merger.set_tensor("cu_window_seqlens", t_cu_window_seqlens);
+        
+        // Print cu_seq_lens shape
+        std::cout << "CU sequence lengths shape: [";
+        for (size_t i = 0; i < cu_seq_lens.get_shape().size(); ++i) {
+            std::cout << cu_seq_lens.get_shape()[i];
+            if (i < cu_seq_lens.get_shape().size() - 1) std::cout << ", ";
+        }
+        std::cout << "] (size: " << cu_seq_lens.get_size() << " elements)" << std::endl;
+        
+        // Print cu_window_seqlens shape
+        std::cout << "CU window sequence lengths shape: [";
+        for (size_t i = 0; i < t_cu_window_seqlens.get_shape().size(); ++i) {
+            std::cout << t_cu_window_seqlens.get_shape()[i];
+            if (i < t_cu_window_seqlens.get_shape().size() - 1) std::cout << ", ";
+        }
+        std::cout << "] (size: " << t_cu_window_seqlens.get_size() << " elements)" << std::endl;
     }
     else {
         ov::Tensor attention_mask = qwen2_vl_utils::get_attention_mask(reordered_images_grid_thw);
@@ -175,14 +249,50 @@ ov::Tensor InputsEmbedderQwen2_5_VL::run_image_embeddings_merger(
         ov::Tensor window_attention_mask = qwen2_5_vl_utils::get_window_attention_mask(hidden_states_size, cu_window_seqlens);
         vision_embeddings_merger.set_tensor("attention_mask", attention_mask);
         vision_embeddings_merger.set_tensor("window_attention_mask", window_attention_mask);
+        
+        // Print attention mask shape
+        std::cout << "Attention mask shape: [";
+        for (size_t i = 0; i < attention_mask.get_shape().size(); ++i) {
+            std::cout << attention_mask.get_shape()[i];
+            if (i < attention_mask.get_shape().size() - 1) std::cout << ", ";
+        }
+        std::cout << "] (size: " << attention_mask.get_size() << " elements)" << std::endl;
+        
+        // Print window attention mask shape
+        std::cout << "Window attention mask shape: [";
+        for (size_t i = 0; i < window_attention_mask.get_shape().size(); ++i) {
+            std::cout << window_attention_mask.get_shape()[i];
+            if (i < window_attention_mask.get_shape().size() - 1) std::cout << ", ";
+        }
+        std::cout << "] (size: " << window_attention_mask.get_size() << " elements)" << std::endl;
     }
+    
     vision_embeddings_merger.set_tensor("rotary_pos_emb", rotary_pos_emb);
     vision_embeddings_merger.set_tensor("window_index", window_index);
     vision_embeddings_merger.infer();
     ov::Tensor processed_vision_embeds = vision_embeddings_merger.get_output_tensor();
+    auto merger_end = std::chrono::high_resolution_clock::now();
+    std::cout << "Vision embeddings merger inference completed in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(merger_end - merger_start).count()
+              << " ms" << std::endl;
 
+    // Create result copy
     ov::Tensor res = ov::Tensor(processed_vision_embeds.get_element_type(), processed_vision_embeds.get_shape());
     std::memcpy(res.data(), processed_vision_embeds.data(), processed_vision_embeds.get_byte_size());
+
+    // Print final processed embeddings shape
+    std::cout << "Final processed vision embeddings shape: [";
+    for (size_t i = 0; i < res.get_shape().size(); ++i) {
+        std::cout << res.get_shape()[i];
+        if (i < res.get_shape().size() - 1) std::cout << ", ";
+    }
+    std::cout << "] (size: " << res.get_size() << " elements)" << std::endl;
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::cout << "=== Total Qwen2.5-VL Image Embeddings Merger time: "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count()
+              << " ms ===" << std::endl;
+
     return res;
 }
 
